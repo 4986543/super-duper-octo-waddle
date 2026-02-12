@@ -1,0 +1,150 @@
+name: Update ipsum IP list (Auto-Switch)
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # daily at 04:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: update-ips
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fetch and Process IPs
+        id: process_ips
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: |
+            set -euo pipefail
+            mkdir -p ips
+
+            # 1. Fetch raw data to a temp file
+            echo "Fetching raw list..."
+            curl -fsSL https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt \
+              | sed 's/\r$//' \
+              | grep -v '^#' \
+              | awk 'NF {print $1}' \
+              | sort -u > /tmp/raw_ips.txt
+
+            # Verify fetch succeeded
+            if [ ! -s /tmp/raw_ips.txt ]; then
+              echo "ERROR: Fetched file is empty or missing"
+              exit 1
+            fi
+
+            # 2. Check the count
+            RAW_COUNT=$(wc -l < /tmp/raw_ips.txt)
+            echo "Total unique IPs fetched: $RAW_COUNT"
+
+            # 3. Decision Logic
+            LIMIT=300000
+            if [ "$RAW_COUNT" -gt "$LIMIT" ]; then
+              echo "Count exceeds $LIMIT. Switching to AGGREGATION mode."
+              echo "mode=aggregate" >> $GITHUB_OUTPUT
+
+              # Run Python aggregation
+              python3 << 'PYTHON_EOF'
+            import ipaddress
+            import sys
+
+            try:
+                ips = []
+                with open('/tmp/raw_ips.txt', 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            ips.append(ipaddress.ip_address(line))
+                        except ValueError:
+                            continue
+
+                if not ips:
+                    open('ips/ipsum-generated.ipset', 'w').close()
+                    open('ips/ipsum-generated2.ipset', 'w').close()
+                    sys.exit(0)
+
+                # Sort and Deduplicate (Critical for max compression)
+                ips = sorted(set(ips))
+
+                # Collapse
+                summarized = list(ipaddress.collapse_addresses([ipaddress.ip_network(ip) for ip in ips]))
+
+                # Separate Ranges and IPs
+                cidr_ranges = []
+                individual_ips = []
+
+                for net in summarized:
+                    if net.prefixlen == 32:
+                        individual_ips.append(net.network_address)
+                    else:
+                        cidr_ranges.append(net)
+
+                # Write Ranges
+                with open('ips/ipsum-generated.ipset', 'w') as f:
+                    for cidr in sorted(cidr_ranges, key=lambda x: (x.network_address, x.prefixlen)):
+                        f.write(str(cidr) + '\n')
+
+                # Write Individual IPs
+                with open('ips/ipsum-generated2.ipset', 'w') as f:
+                    for ip in sorted(set(individual_ips)):
+                        f.write(str(ip) + '\n')
+
+                print(f"Aggregated {len(ips)} IPs into {len(cidr_ranges)} ranges + {len(individual_ips)} singles.", file=sys.stderr)
+            except Exception as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                sys.exit(1)
+            PYTHON_EOF
+
+            else
+              echo "Count is within limit. Using RAW mode."
+              echo "mode=raw" >> $GITHUB_OUTPUT
+              cp /tmp/raw_ips.txt ips/ipsum-generated.ipset
+              # Ensure secondary file exists but is empty for consistency
+              > ips/ipsum-generated2.ipset
+            fi
+
+      - name: Verify files
+        run: |
+          echo "=== Mode Used: ${{ steps.process_ips.outputs.mode }} ==="
+          echo "=== ipsum-generated.ipset ==="
+          wc -l ips/ipsum-generated.ipset
+          head -5 ips/ipsum-generated.ipset
+          echo "=== ipsum-generated2.ipset ==="
+          wc -l ips/ipsum-generated2.ipset
+          head -5 ips/ipsum-generated2.ipset
+
+      - name: Commit and push changes
+        env:
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_COMMITTER_NAME"
+          git config user.email "$GIT_COMMITTER_EMAIL"
+          git add ips/ipsum-generated.ipset ips/ipsum-generated2.ipset
+          if ! git diff --staged --quiet -- ips/; then
+            git commit -m "Update IPset: Mode ${{ steps.process_ips.outputs.mode }}"
+            git push origin HEAD:refs/heads/main
+          else
+            echo "No changes to push"
+            git reset -- ips/
+          fi
