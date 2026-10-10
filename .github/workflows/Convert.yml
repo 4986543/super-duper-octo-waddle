@@ -1,0 +1,51 @@
+name: Update ipsum IP list
+on:
+  schedule:
+    - cron: "0 4 * * *" # daily at 04:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install curl
+        run: sudo apt-get update -qq && sudo apt-get install -y curl
+
+      - name: Generate ipset file
+        run: |
+          set -euo pipefail
+          mkdir -p ips
+
+          
+          curl -fsSL https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt \
+            | sed 's/\r$//' \
+            | grep -v '^#' \
+            | awk 'NF {print $1}' \
+            | sort -u > ips/ipsum-generated.ipset
+
+      - name: Commit and push changes if any
+        env:
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_COMMITTER_NAME"
+          git config user.email "$GIT_COMMITTER_EMAIL"
+          
+          git add ips/ipsum-generated.ipset
+          
+          if ! git diff --staged --quiet -- ips/ipsum-generated.ipset; then
+            git commit -m "Update IPset file: Full unfiltered list"
+            git push origin HEAD:refs/heads/main
+          else
+            echo "No changes to push"
+            git reset -- ips/ipsum-generated.ipset
+          fi
