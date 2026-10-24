@@ -1,0 +1,305 @@
+name: Update ipsum IP list with Range Aggregation
+on:
+  schedule:
+    - cron: "0 4 * * *" # daily at 04:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y curl
+
+      - name: Generate and aggregate ipset file
+        run: |
+          set -euo pipefail
+          mkdir -p ips
+
+          # Fetch ALL IP addresses (no score filtering)
+          # grep removes comments, awk handles tabs/multiple spaces
+          curl -fsSL https://raw.githubusercontent.com/stamparm/ipsum/master/ipsum.txt \
+            | sed 's/\r$//' \
+            | grep -v '^#' \
+            | awk 'NF {print $1}' > /tmp/raw_ips.txt
+
+          # Check if we got any IPs
+          RAW_COUNT=$(wc -l < /tmp/raw_ips.txt)
+          echo "Raw IPs fetched: $RAW_COUNT"
+
+          # Aggregate using Python's collapse_addresses
+          python3 << 'PYTHON_EOF'
+          import ipaddress
+          import sys
+
+          try:
+              # Read raw IPs
+              ips = []
+              failed_ips = []
+              with open('/tmp/raw_ips.txt', 'r') as f:
+                  for line_num, line in enumerate(f, 1):
+                      line = line.strip()
+                      if not line: continue
+                      try:
+                          parsed_ip = ipaddress.ip_address(line)
+                          ips.append(parsed_ip)
+                      except ValueError as e:
+                          failed_ips.append((line_num, line, str(e)))
+
+              print(f"Successfully parsed: {len(ips)} IPs", file=sys.stderr)
+              if failed_ips:
+                  print(f"Failed to parse: {len(failed_ips)} IPs", file=sys.stderr)
+
+              if not ips:
+                  print("ERROR: No valid IPs found!", file=sys.stderr)
+                  open('ips/ipsum-generated.ipset', 'w').close()
+                  open('ips/ipsum-generated2.ipset', 'w').close()
+                  sys.exit(0)
+
+              # Remove duplicates and sort
+              ips = sorted(set(ips))
+              print(f"After deduplication: {len(ips)} unique IPs", file=sys.stderr)
+
+              # Convert to networks for summarization
+              ip_networks = [ipaddress.ip_network(ip, strict=False) for ip in ips]
+
+              # Collapse addresses
+              summarized = list(ipaddress.collapse_addresses(ip_networks))
+              print(f"Collapsed to {len(summarized)} networks/IPs", file=sys.stderr)
+
+              # Separate into ranges and individual IPs
+              cidr_ranges = []
+              individual_ips = []
+              for net in summarized:
+                  if net.prefixlen == 32:
+                      individual_ips.append(net.network_address)
+                  else:
+                      cidr_ranges.append(net)
+
+              print(f"Actual CIDR ranges: {len(cidr_ranges)}", file=sys.stderr)
+              print(f"Individual IPs: {len(individual_ips)}", file=sys.stderr)
+
+              # Sort and deduplicate
+              cidr_ranges_sorted = sorted(cidr_ranges, key=lambda x: (x.network_address, x.prefixlen))
+              individual_ips_sorted = sorted(set(individual_ips))
+
+              # Write main file: CIDR ranges
+              with open('ips/ipsum-generated.ipset', 'w') as f:
+                  for cidr in cidr_ranges_sorted:
+                      f.write(str(cidr) + '\n')
+              print(f"Wrote {len(cidr_ranges_sorted)} CIDR ranges to ipsum-generated.ipset", file=sys.stderr)
+
+              # Write secondary file: individual IPs
+              with open('ips/ipsum-generated2.ipset', 'w') as f:
+                  for ip in individual_ips_sorted:
+                      f.write(str(ip) + '\n')
+              print(f"Wrote {len(individual_ips_sorted)} individual IPs to ipsum-generated2.ipset", file=sys.stderr)
+
+              total_ips = len(ips)
+              total_entries = len(cidr_ranges_sorted) + len(individual_ips_sorted)
+              compression = total_ips / total_entries if total_entries > 0 else 1
+              print(f"Compression ratio: {compression:.2f}x", file=sys.stderr)
+
+          except Exception as e:
+              print(f"FATAL ERROR: {e}", file=sys.stderr)
+              import traceback
+              traceback.print_exc(file=sys.stderr)
+              sys.exit(1)
+          PYTHON_EOF
+
+      - name: Verify files before commit
+        run: |
+          echo "=== File Size Check ==="
+          ls -lh ips/
+          echo ""
+          echo "=== ipsum-generated.ipset (first 20 lines) ==="
+          head -20 ips/ipsum-generated.ipset
+          echo ""
+          echo "=== ipsum-generated2.ipset (first 20 lines) ==="
+          head -20 ips/ipsum-generated2.ipset
+          echo ""
+          echo "=== Line counts ==="
+          echo "ipsum-generated.ipset: $(wc -l < ips/ipsum-generated.ipset) lines"
+          echo "ipsum-generated2.ipset: $(wc -l < ips/ipsum-generated2.ipset) lines"
+
+      - name: Commit and push changes if any
+        env:
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_COMMITTER_NAME"
+          git config user.email "$GIT_COMMITTER_EMAIL"
+          git add ips/ipsum-generated.ipset ips/ipsum-generated2.ipset
+          if ! git diff --staged --quiet -- ips/; then
+            git commit -m "Update IPset files: aggregated CIDR ranges and isolated IPs"
+            git push origin HEAD:refs/heads/main
+          else
+            echo "No changes to push"
+            git reset -- ips/
+          fi          # Check if we got any IPs
+          RAW_COUNT=$(wc -l < /tmp/raw_ips.txt)
+          echo "Raw IPs fetched: $RAW_COUNT"
+
+          # Aggregate using Python's collapse_addresses with proper error handling
+          python3 << 'PYTHON_EOF'
+          import ipaddress
+          import sys
+
+          try:
+              # Read raw IPs
+              ips = []
+              failed_ips = []
+              
+              with open('/tmp/raw_ips.txt', 'r') as f:
+                  for line_num, line in enumerate(f, 1):
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          parsed_ip = ipaddress.ip_address(line)
+                          ips.append(parsed_ip)
+                      except ValueError as e:
+                          failed_ips.append((line_num, line, str(e)))
+
+              print(f"Successfully parsed: {len(ips)} IPs", file=sys.stderr)
+              if failed_ips:
+                  print(f"Failed to parse: {len(failed_ips)} IPs", file=sys.stderr)
+                  for line_num, ip, error in failed_ips[:5]:
+                      print(f"  Line {line_num}: {ip} - {error}", file=sys.stderr)
+              
+              if not ips:
+                  print("ERROR: No valid IPs found!", file=sys.stderr)
+                  # Create empty files
+                  open('ips/ipsum-generated.ipset', 'w').close()
+                  open('ips/ipsum-generated2.ipset', 'w').close()
+                  sys.exit(0)
+
+              # Remove duplicates and sort for consistency
+              ips = sorted(set(ips))
+              print(f"After deduplication: {len(ips)} unique IPs", file=sys.stderr)
+
+              # Convert to networks for summarization
+              try:
+                  ip_networks = [ipaddress.ip_network(ip, strict=False) for ip in ips]
+              except Exception as e:
+                  print(f"ERROR converting to networks: {e}", file=sys.stderr)
+                  sys.exit(1)
+
+              # Use collapse_addresses for intelligent aggregation
+              try:
+                  summarized = list(ipaddress.collapse_addresses(ip_networks))
+              except Exception as e:
+                  print(f"ERROR during collapse_addresses: {e}", file=sys.stderr)
+                  sys.exit(1)
+              
+              print(f"Collapsed to {len(summarized)} networks/IPs", file=sys.stderr)
+
+              # Separate into actual ranges (prefixlen < 32) and individual IPs (prefixlen == 32)
+              cidr_ranges = []
+              individual_ips = []
+              
+              for net in summarized:
+                  try:
+                      if net.prefixlen == 32:
+                          # Individual IP that couldn't be merged - store just the IP address
+                          individual_ips.append(net.network_address)
+                      else:
+                          # Actual CIDR range (successfully aggregated multiple IPs)
+                          cidr_ranges.append(net)
+                  except Exception as e:
+                      print(f"ERROR processing network {net}: {e}", file=sys.stderr)
+                      continue
+
+              print(f"Actual CIDR ranges: {len(cidr_ranges)}", file=sys.stderr)
+              print(f"Individual IPs: {len(individual_ips)}", file=sys.stderr)
+
+              # Sort CIDR ranges numerically
+              cidr_ranges_sorted = sorted(cidr_ranges, key=lambda x: (x.network_address, x.prefixlen))
+              individual_ips_sorted = sorted(set(individual_ips))  # Deduplicate again
+
+              # Write main file: ONLY actual CIDR ranges
+              try:
+                  with open('ips/ipsum-generated.ipset', 'w') as f:
+                      for cidr in cidr_ranges_sorted:
+                          f.write(str(cidr) + '\n')
+                  print(f"✓ Wrote {len(cidr_ranges_sorted)} CIDR ranges to ipsum-generated.ipset", file=sys.stderr)
+              except Exception as e:
+                  print(f"ERROR writing ipsum-generated.ipset: {e}", file=sys.stderr)
+                  sys.exit(1)
+
+              # Write secondary file: individual IPs that couldn't be merged
+              try:
+                  with open('ips/ipsum-generated2.ipset', 'w') as f:
+                      for ip in individual_ips_sorted:
+                          f.write(str(ip) + '\n')
+                  print(f"✓ Wrote {len(individual_ips_sorted)} individual IPs to ipsum-generated2.ipset", file=sys.stderr)
+              except Exception as e:
+                  print(f"ERROR writing ipsum-generated2.ipset: {e}", file=sys.stderr)
+                  sys.exit(1)
+
+              total_ips = len(ips)
+              total_entries = len(cidr_ranges_sorted) + len(individual_ips_sorted)
+              compression = total_ips / total_entries if total_entries > 0 else 1
+
+              print(f"\n{'='*50}", file=sys.stderr)
+              print(f"AGGREGATION SUMMARY", file=sys.stderr)
+              print(f"{'='*50}", file=sys.stderr)
+              print(f"Total IPs processed: {total_ips}", file=sys.stderr)
+              print(f"CIDR ranges created: {len(cidr_ranges_sorted)}", file=sys.stderr)
+              print(f"Individual isolated IPs: {len(individual_ips_sorted)}", file=sys.stderr)
+              print(f"Total entries in output: {total_entries}", file=sys.stderr)
+              print(f"Compression ratio: {compression:.2f}x", file=sys.stderr)
+              print(f"{'='*50}", file=sys.stderr)
+
+          except Exception as e:
+              print(f"FATAL ERROR: {e}", file=sys.stderr)
+              import traceback
+              traceback.print_exc(file=sys.stderr)
+              sys.exit(1)
+          PYTHON_EOF
+
+      - name: Verify files before commit
+        run: |
+          echo "=== File Size Check ==="
+          ls -lh ips/
+          echo ""
+          echo "=== ipsum-generated.ipset (first 20 lines) ==="
+          head -20 ips/ipsum-generated.ipset
+          echo ""
+          echo "=== ipsum-generated2.ipset (first 20 lines) ==="
+          head -20 ips/ipsum-generated2.ipset
+          echo ""
+          echo "=== Line counts ==="
+          echo "ipsum-generated.ipset: $(wc -l < ips/ipsum-generated.ipset) lines"
+          echo "ipsum-generated2.ipset: $(wc -l < ips/ipsum-generated2.ipset) lines"
+
+      - name: Commit and push changes if any
+        env:
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: github-actions[bot]@users.noreply.github.com
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_COMMITTER_NAME"
+          git config user.email "$GIT_COMMITTER_EMAIL"
+
+          git add ips/ipsum-generated.ipset ips/ipsum-generated2.ipset
+          if ! git diff --staged --quiet -- ips/; then
+            git commit -m "Update IPset files: aggregated CIDR ranges and isolated IPs"
+            git push origin HEAD:refs/heads/main
+          else
+            echo "No changes to push"
+            git reset -- ips/
+          fi
+
+#source ipsum by stamparmm
